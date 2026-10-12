@@ -33,7 +33,7 @@ jobs:
 
       - name: Publish self-contained
         run: |
-          dotnet publish Bankomat\Bankomat.csproj \
+          dotnet publish Bankomat/Bankomat.csproj \
             --configuration Release \
             --runtime ${{ matrix.rid }} \
             --self-contained true \
