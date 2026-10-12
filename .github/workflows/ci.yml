@@ -29,11 +29,11 @@ jobs:
 
       - name: Test with coverage
         run: |
-          dotnet test Bankomat.Tests\Bankomat.Tests.csproj \
+          dotnet test Bankomat.Tests/Bankomat.Tests.csproj \
             --configuration Release \
             --no-build \
             --collect:"XPlat Code Coverage" \
-            --settings Bankomat.Tests\coverlet.runsettings \
+            --settings Bankomat.Tests/coverlet.runsettings \
             --results-directory TestResults
 
       - name: Generate coverage report
