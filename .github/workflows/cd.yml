@@ -1,0 +1,72 @@
+name: CD
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    strategy:
+      matrix:
+        include:
+          - rid: win-x64
+            artifact: Bankomat-win-x64
+          - rid: linux-x64
+            artifact: Bankomat-linux-x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore Bankomat.sln
+
+      - name: Publish self-contained
+        run: |
+          dotnet publish Bankomat\Bankomat.csproj \
+            --configuration Release \
+            --runtime ${{ matrix.rid }} \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:Version=${{ github.ref_name }} \
+            -o publish/${{ matrix.artifact }}
+
+      - name: Create zip
+        run: |
+          cd publish
+          zip -r ../${{ matrix.artifact }}-${{ github.ref_name }}.zip ${{ matrix.artifact }}/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-${{ github.ref_name }}
+          path: ${{ matrix.artifact }}-${{ github.ref_name }}.zip
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: 'Bankomat-*'
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.zip'
+          generate_release_notes: true

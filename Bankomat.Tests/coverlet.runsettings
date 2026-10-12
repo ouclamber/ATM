@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RunSettings>
+  <DataCollectionRunSettings>
+    <DataCollectors>
+      <DataCollector friendlyName="XPlat code coverage">
+        <Configuration>
+          <Format>cobertura</Format>
+
+          <!-- Исключаем файлы -->
+          <ExcludeByFile>
+            **/Migrations/*.cs,
+            **/obj/**/*.cs,
+            **/bin/**/*.cs,
+            **/Program.cs,
+            **/Presentation/Menus/*.cs,
+            **/Infrastructure/Persistence/Configurations/*.cs,
+            **/Infrastructure/Persistence/UnitOfWork.cs,
+            **/Infrastructure/Persistence/BankomatDbContext.cs,
+            **/Infrastructure/Persistence/BankomatDbContextFactory.cs,
+            **/Infrastructure/Persistence/Repositories/*.cs,
+            **/Infrastructure/Persistence/UnitOfWork.cs,
+            **/Infrastructure/Configuration/BankConfig.cs
+          </ExcludeByFile>
+
+          <!-- Исключаем по атрибутам -->
+          <ExcludeByAttribute>
+            Obsolete,
+            GeneratedCodeAttribute,
+            CompilerGeneratedAttribute,
+            ExcludeFromCodeCoverageAttribute
+          </ExcludeByAttribute>
+
+          <!-- Исключаем namespace'ы -->
+          <Exclude>
+            [Bankomat.Tests]*,
+            [Bankomat]Bankomat.Presentation.*,
+            [Bankomat]Bankomat.Infrastructure.Persistence.*
+          </Exclude>
+
+          <!-- Порог покрытия (опционально) -->
+          <Threshold>80</Threshold>
+          <ThresholdType>line</ThresholdType>
+          <ThresholdStat>total</ThresholdStat>
+        </Configuration>
+      </DataCollector>
+    </DataCollectors>
+  </DataCollectionRunSettings>
+</RunSettings>

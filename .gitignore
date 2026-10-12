@@ -1,0 +1,23 @@
+
+# Build artifacts
+bin/
+obj/
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# Logs
+logs/
+*.log
+
+# Coverage
+coveragereport/
+TestResults/
+*.cobertura.xml
+
+# Secrets
+appsettings.Development.json
+appsettings.local.json

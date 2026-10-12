@@ -1,0 +1,6 @@
+@BankomatBackend_HostAddress = http://localhost:5074
+
+GET {{BankomatBackend_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
