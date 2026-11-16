@@ -1,11 +1,12 @@
-
 # Build artifacts
 bin/
 obj/
+publish/
 
 # IDE
 .vs/
 .vscode/
+.idea/
 *.user
 *.suo
 
@@ -18,6 +19,11 @@ coveragereport/
 TestResults/
 *.cobertura.xml
 
-# Secrets
+# Secrets / локальные настройки (шаблон: Bankomat/appsettings.Development.example.json)
 appsettings.Development.json
 appsettings.local.json
+.env
+
+# Служебные папки
+_backup/
+.claude-tmp/

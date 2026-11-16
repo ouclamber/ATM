@@ -220,4 +220,52 @@ public class WithdrawHandlerTests
         captured!.BalanceBefore.Amount.Should().Be(1000);
         captured.BalanceAfter.Amount.Should().Be(700);
     }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-100)]
+    public async Task Withdraw_NonPositiveAmount_FailsWithoutDbAccess(decimal amount)
+    {
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(1, 1, amount);
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("VALIDATION");
+        _accounts.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task Withdraw_ConcurrencyConflict_ReturnsConflict()
+    {
+        var account = TestData.CreateAccount(balance: 1000, id: 1);
+        var atm = TestData.CreateAtm(id: 1);
+        _accounts.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(account);
+        _atms.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(atm);
+        _transactions.Setup(r => r.GetWithdrawSumLast24hAsync(1, default)).ReturnsAsync(0m);
+        _uow.Setup(u => u.SaveChangesAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ConcurrencyConflictException("conflict"));
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(1, 1, 500);
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("CONFLICT");
+    }
+
+    [Fact]
+    public async Task Withdraw_InsufficientBalance_DoesNotTouchCassettes()
+    {
+        var account = TestData.CreateAccount(balance: 100, id: 1);
+        var atm = TestData.CreateAtm(id: 1);
+        _accounts.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(account);
+        _atms.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(atm);
+        _transactions.Setup(r => r.GetWithdrawSumLast24hAsync(1, default)).ReturnsAsync(0m);
+        SetupDefaultConfig();
+
+        await CreateHandler().HandleAsync(1, 1, 5000);
+
+        atm.Cassettes.First(c => c.Denomination == 5000).Count.Should().Be(100);
+        _uow.Verify(u => u.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Never);
+    }
 }

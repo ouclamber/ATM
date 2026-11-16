@@ -1,4 +1,4 @@
-﻿using Bankomat.Domain.Accounts;
+using Bankomat.Domain.Accounts;
 using Bankomat.Domain.ValueObjects;
 using Microsoft.EntityFrameworkCore;
 
@@ -12,9 +12,22 @@ public class BankAccountRepository : IBankAccountRepository
     public Task<BankAccount?> GetByIdAsync(int id, CancellationToken ct = default) =>
         _db.Accounts.FirstOrDefaultAsync(a => a.Id == id, ct);
 
-    public Task<BankAccount?> GetByCardNumberAsync(CardNumber cardNumber, CancellationToken ct = default)
+    public Task<BankAccount?> GetByCardNumberAsync(CardNumber cardNumber, CancellationToken ct = default) =>
+        _db.Accounts.FirstOrDefaultAsync(a => a.CardNumber == cardNumber, ct);
+
+    public async Task<HashSet<string>> GetExistingCardNumbersAsync(
+        IReadOnlyCollection<CardNumber> cardNumbers, CancellationToken ct = default)
     {
-        return _db.Accounts.FirstOrDefaultAsync(a => a.CardNumber == cardNumber, ct);
+        if (cardNumbers.Count == 0)
+            return new HashSet<string>();
+
+        var found = await _db.Accounts
+            .AsNoTracking()
+            .Where(a => cardNumbers.Contains(a.CardNumber))
+            .Select(a => a.CardNumber)
+            .ToListAsync(ct);
+
+        return found.Select(c => c.Value).ToHashSet();
     }
 
     public async Task AddAsync(BankAccount account, CancellationToken ct = default) =>

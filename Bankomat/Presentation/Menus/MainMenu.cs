@@ -1,4 +1,4 @@
-﻿using Bankomat.Application.Abstractions;
+using Bankomat.Application.Abstractions;
 using Bankomat.Application.Authentication;
 using Microsoft.Extensions.DependencyInjection;
 using Spectre.Console;
@@ -7,22 +7,36 @@ namespace Bankomat.Presentation.Menus;
 
 public class MainMenu
 {
-    private readonly IServiceProvider _sp;
+    private static readonly Serilog.ILogger Log = Serilog.Log.ForContext<MainMenu>();
+
+    private readonly IServiceScopeFactory _scopes;
     private readonly UserSession _session;
     private readonly IBankConfig _config;
+    private readonly IAdminAuthService _adminAuth;
+    private readonly ClientMenu _clientMenu;
+    private readonly AdminMenu _adminMenu;
 
-    public MainMenu(IServiceProvider sp, UserSession session, IBankConfig config)
+    public MainMenu(
+        IServiceScopeFactory scopes,
+        UserSession session,
+        IBankConfig config,
+        IAdminAuthService adminAuth,
+        ClientMenu clientMenu,
+        AdminMenu adminMenu)
     {
-        _sp = sp;
+        _scopes = scopes;
         _session = session;
         _config = config;
+        _adminAuth = adminAuth;
+        _clientMenu = clientMenu;
+        _adminMenu = adminMenu;
     }
 
-    public async Task RunAsync()
+    public async Task RunAsync(CancellationToken ct = default)
     {
-        while (true)
+        while (!ct.IsCancellationRequested)
         {
-            Console.Clear();
+            Ui.Clear();
             AnsiConsole.Write(new FigletText("БАНКОМАТ").Centered().Color(Color.Blue));
 
             AnsiConsole.Write(new Panel("[yellow]Система управления банкоматом[/]")
@@ -41,55 +55,62 @@ public class MainMenu
 
             switch (choice)
             {
-                case "Войти как клиент":        await LoginAsync(); break;
-                case "Административная панель": await AdminAsync(); break;
+                case "Войти как клиент":
+                    await Ui.GuardAsync(() => LoginAsync(ct), Log, "Вход клиента");
+                    _session.Logout(); // гарантированный выход даже после сбоя
+                    break;
+                case "Административная панель":
+                    await Ui.GuardAsync(() => AdminAsync(ct), Log, "Вход администратора");
+                    break;
                 case "Выход":
-                    Console.Clear();
+                    Ui.Clear();
                     AnsiConsole.Write(new FigletText("До свидания!").Centered().Color(Color.Green));
                     return;
             }
         }
     }
 
-    private async Task LoginAsync()
+    private async Task LoginAsync(CancellationToken ct)
     {
-        Console.Clear();
+        Ui.Clear();
 
         var card = AnsiConsole.Prompt(
             new TextPrompt<string>("[white]Номер карты:[/]")
-                .Validate(c =>
-                {
-                    var clean = c.Replace(" ", "").Replace("-", "");
-                    return clean.Length == 16 && clean.All(char.IsDigit)
-                        ? ValidationResult.Success()
-                        : ValidationResult.Error("[red]16 цифр[/]");
-                }));
+                .Validate(c => Ui.IsValidCard(c)
+                    ? ValidationResult.Success()
+                    : ValidationResult.Error("[red]Нужно 16 цифр (пробелы и дефисы допускаются)[/]")));
 
         var pin = AnsiConsole.Prompt(
             new TextPrompt<string>("[white]PIN:[/]").Secret());
 
-        using var scope = _sp.CreateScope();
+        using var scope = _scopes.CreateScope();
         var handler = scope.ServiceProvider.GetRequiredService<LoginHandler>();
-        var result = await handler.HandleAsync(card, pin, _config.DefaultAtmId);
+        var result = await handler.HandleAsync(card, pin, _config.DefaultAtmId, ct);
 
         if (result.IsFailure)
         {
-            AnsiConsole.MarkupLine($"[red]{result.Error.Message}[/]");
-            await Task.Delay(2000);
+            Ui.Error(result.Error.Message);
+            await Task.Delay(2000, ct);
             return;
         }
 
-        _session.CurrentAccount = result.Value;
-        AnsiConsole.MarkupLine($"[green]Добро пожаловать, {result.Value.HolderName}![/]");
-        await Task.Delay(1200);
+        _session.Start(result.Value);
+        Ui.Success($"Добро пожаловать, {result.Value.HolderName}!");
+        await Task.Delay(1200, ct);
 
-        var clientMenu = scope.ServiceProvider.GetRequiredService<ClientMenu>();
-        await clientMenu.RunAsync();
+        await _clientMenu.RunAsync(ct);
     }
 
-    private async Task AdminAsync()
+    private async Task AdminAsync(CancellationToken ct)
     {
-        Console.Clear();
+        Ui.Clear();
+
+        if (_adminAuth.LockoutRemaining is { } locked)
+        {
+            Ui.Error($"Вход временно заблокирован из-за неверных попыток. Повторите через {Math.Ceiling(locked.TotalMinutes)} мин.");
+            await Task.Delay(2500, ct);
+            return;
+        }
 
         AnsiConsole.Write(new Panel("[yellow]ВХОД В АДМИН-ПАНЕЛЬ[/]")
             .Border(BoxBorder.Rounded)
@@ -105,22 +126,22 @@ public class MainMenu
                 .PromptStyle("red")
                 .Secret());
 
-        using var scope = _sp.CreateScope();
-        var auth = scope.ServiceProvider.GetRequiredService<IAdminAuthService>();
-
-        if (!auth.Verify(username, password))
+        if (!_adminAuth.Verify(username, password))
         {
-            Console.Clear();
-            AnsiConsole.MarkupLine("[red]Неверный логин или пароль[/]");
-            await Task.Delay(2000);
+            Log.Warning("Admin: неудачная попытка входа под логином {Username}", username);
+            Ui.Clear();
+            Ui.Error(_adminAuth.LockoutRemaining is { } lockout
+                ? $"Слишком много неверных попыток. Вход заблокирован на {Math.Ceiling(lockout.TotalMinutes)} мин."
+                : "Неверный логин или пароль");
+            await Task.Delay(2000, ct);
             return;
         }
 
-        Console.Clear();
-        AnsiConsole.MarkupLine("[green]Добро пожаловать, администратор[/]");
-        await Task.Delay(1000);
+        Log.Information("Admin: успешный вход под логином {Username}", username);
+        Ui.Clear();
+        Ui.Success("Добро пожаловать, администратор");
+        await Task.Delay(1000, ct);
 
-        var adminMenu = scope.ServiceProvider.GetRequiredService<AdminMenu>();
-        await adminMenu.RunAsync();
+        await _adminMenu.RunAsync(ct);
     }
 }

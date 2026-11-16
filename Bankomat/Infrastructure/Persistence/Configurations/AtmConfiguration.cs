@@ -1,4 +1,4 @@
-﻿using Bankomat.Domain.Atms;
+using Bankomat.Domain.Atms;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
 
@@ -30,6 +30,10 @@ public class AtmConfiguration : IEntityTypeConfiguration<Atm>
             cb.Property(c => c.Denomination).HasColumnName("denomination").IsRequired();
             cb.Property(c => c.Count).HasColumnName("count").IsRequired();
             cb.Property(c => c.MaxCapacity).HasColumnName("max_capacity").IsRequired();
+
+            // Конкурентность на уровне строки кассеты: два банкомата/сеанса не смогут
+            // одновременно выдать одни и те же купюры.
+            cb.Property<uint>("xmin").IsRowVersion();
 
             cb.HasIndex(c => new { c.AtmId, c.Denomination })
               .IsUnique()

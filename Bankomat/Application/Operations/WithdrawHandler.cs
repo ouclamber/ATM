@@ -1,4 +1,5 @@
-﻿using Bankomat.Application.Abstractions;
+using Bankomat.Application.Abstractions;
+using Bankomat.Application.Common;
 using Bankomat.Domain.Accounts;
 using Bankomat.Domain.Atms;
 using Bankomat.Domain.Common;
@@ -42,125 +43,85 @@ public class WithdrawHandler
             "Withdraw: начало операции, счёт {AccountId}, банкомат {AtmId}, сумма {Amount}",
             accountId, atmId, amountValue);
 
+        // 1. Дешёвые проверки без обращения к БД
         var amountResult = Money.Create(amountValue);
         if (amountResult.IsFailure)
-        {
-            _logger.LogWarning(
-                "Withdraw: невалидная сумма {Amount} — {Reason}",
-                amountValue, amountResult.Error.Message);
-            return amountResult.Error;
-        }
+            return Reject(accountId, amountResult.Error);
         var amount = amountResult.Value;
 
-        if (amount.Amount > _config.MaxWithdrawalPerTransaction)
-        {
-            _logger.LogWarning(
-                "Withdraw: превышен лимит за операцию, счёт {AccountId}, сумма {Amount}, лимит {Limit}",
-                accountId, amount, _config.MaxWithdrawalPerTransaction);
+        if (amount <= Money.Zero)
+            return Reject(accountId, Error.Validation("Сумма должна быть больше нуля"));
 
-            return Error.Business(
-                $"Лимит за операцию: {_config.MaxWithdrawalPerTransaction:C}");
-        }
+        if (amount.Amount > _config.MaxWithdrawalPerTransaction)
+            return Reject(accountId, Error.Business(
+                $"Лимит за операцию: {_config.MaxWithdrawalPerTransaction:C}"));
 
         if (!amount.IsMultipleOf(100))
-        {
-            _logger.LogWarning(
-                "Withdraw: сумма {Amount} не кратна 100, счёт {AccountId}",
-                amount, accountId);
+            return Reject(accountId, Error.Validation("Сумма должна быть кратна 100"));
 
-            return Error.Validation("Сумма должна быть кратна 100");
-        }
-
+        // 2. Загрузка агрегатов
         var account = await _accounts.GetByIdAsync(accountId, ct);
         if (account is null)
-        {
-            _logger.LogWarning("Withdraw: счёт {AccountId} не найден", accountId);
-            return Error.NotFound("Счет не найден");
-        }
+            return Reject(accountId, Error.NotFound("Счет не найден"));
 
         var atm = await _atms.GetByIdAsync(atmId, ct);
         if (atm is null)
-        {
-            _logger.LogWarning(
-                "Withdraw: банкомат {AtmId} не найден, счёт {AccountId}",
-                atmId, accountId);
-
-            return Error.NotFound("Банкомат не найден");
-        }
+            return Reject(accountId, Error.NotFound("Банкомат не найден"));
 
         if (!atm.IsActive)
-        {
-            _logger.LogWarning(
-                "Withdraw: банкомат {AtmId} неактивен, счёт {AccountId}",
-                atmId, accountId);
+            return Reject(accountId, Error.Business("Банкомат неактивен"));
 
-            return Error.Business("Банкомат неактивен");
-        }
-
+        // 3. Дневной лимит
         var last24 = await _transactions.GetWithdrawSumLast24hAsync(accountId, ct);
         if (last24 + amount.Amount > _config.MaxWithdrawalPerDay)
-        {
-            _logger.LogWarning(
-                "Withdraw: превышен дневной лимит, счёт {AccountId}, уже снято за 24ч {Last24}, запрос {Amount}, лимит {Limit}",
-                accountId, last24, amount, _config.MaxWithdrawalPerDay);
+            return Reject(accountId, Error.Business(
+                $"Превышен дневной лимит ({_config.MaxWithdrawalPerDay:C}). Уже снято за 24 ч: {last24:C}"));
 
-            return Error.Business(
-                $"Превышен дневной лимит ({_config.MaxWithdrawalPerDay:C}). Уже снято за 24 ч: {last24:C}");
-        }
-
+        // 4. Доменная логика: план выдачи → списание со счёта → списание из кассет
         var planResult = atm.PlanWithdrawal(amount);
         if (planResult.IsFailure)
-        {
-            _logger.LogWarning(
-                "Withdraw: план выдачи невозможен, счёт {AccountId}, сумма {Amount}, причина: {Reason}",
-                accountId, amount, planResult.Error.Message);
-
-            return planResult.Error;
-        }
+            return Reject(accountId, planResult.Error);
         var plan = planResult.Value;
+
+        var balanceBefore = account.Balance;
 
         var debitResult = account.Debit(amount);
         if (debitResult.IsFailure)
-        {
-            _logger.LogWarning(
-                "Withdraw: списание отклонено, счёт {AccountId}, сумма {Amount}, баланс {Balance}, причина: {Reason}",
-                accountId, amount, account.Balance, debitResult.Error.Message);
-
-            return debitResult.Error;
-        }
+            return Reject(accountId, debitResult.Error);
 
         var applyResult = atm.ApplyWithdrawal(plan);
         if (applyResult.IsFailure)
         {
+            // Не должно случаться: план построен по этим же кассетам
             _logger.LogError(
                 "Withdraw: ошибка применения выдачи, счёт {AccountId}, банкомат {AtmId}, причина: {Reason}",
                 accountId, atmId, applyResult.Error.Message);
-
             return applyResult.Error;
         }
 
-        var log = Transaction.Record(
+        await _transactions.AddAsync(Transaction.Record(
             account.Id, atm.Id, TransactionType.Withdraw,
-            amount, account.Balance + amount, account.Balance,
-            $"Снятие {amount}");
+            amount, balanceBefore, account.Balance,
+            $"Снятие {amount}"), ct);
 
-        await _transactions.AddAsync(log, ct);
-        await _uow.SaveChangesAsync(ct);
+        // 5. Баланс, кассеты и журнал сохраняются одним атомарным SaveChanges.
+        //    Токены конкурентности (xmin) не дадут двум банкоматам одновременно списать одни и те же деньги.
+        var saved = await _uow.TrySaveChangesAsync(ct);
+        if (saved.IsFailure)
+            return Reject(accountId, saved.Error);
 
         _logger.LogInformation(
-            "Withdraw: успешно, счёт {AccountId}, банкомат {AtmId}, сумма {Amount}, новый баланс {Balance}, выдано купюр: {Banknotes}",
-            accountId, atmId, amount, account.Balance, FormatBanknotes(plan.Banknotes));
+            "Withdraw: успешно, счёт {AccountId}, банкомат {AtmId}, сумма {Amount}, выдано купюр: {Banknotes}",
+            accountId, atmId, amount, LogFormat.Banknotes(plan.Banknotes));
 
         return new WithdrawResponse(account.Balance, plan.Banknotes);
     }
 
-    private static string FormatBanknotes(IReadOnlyDictionary<int, int> banknotes)
+    private Error Reject(int accountId, Error error)
     {
-        if (banknotes.Count == 0)
-            return "[]";
-
-        return "[" + string.Join(", ", banknotes
-            .OrderByDescending(x => x.Key)
-            .Select(x => $"{x.Key}×{x.Value}")) + "]";
+        _logger.LogWarning(
+            "Withdraw: отклонено, счёт {AccountId}, код {Code}, причина: {Reason}",
+            accountId, error.Code, error.Message);
+        return error;
     }
 }

@@ -1,4 +1,4 @@
-﻿using Bankomat.Domain.Common;
+using Bankomat.Domain.Common;
 using Bankomat.Domain.ValueObjects;
 
 namespace Bankomat.Domain.Accounts;
@@ -14,7 +14,9 @@ public class BankAccount : AggregateRoot
     public DateTime CreatedAt { get; private set; }
     public DateTime? LastAccessAt { get; private set; }
 
-    private const int MaxFailedAttempts = 3;
+    public const int MaxFailedAttempts = 3;
+
+    public int RemainingAttempts => Math.Max(0, MaxFailedAttempts - FailedLoginAttempts);
 
     private BankAccount() { } // EF
 
@@ -60,6 +62,9 @@ public class BankAccount : AggregateRoot
 
     public void RegisterSuccessfulLogin()
     {
+        if (IsBlocked)
+            throw new DomainException("Нельзя войти по заблокированной карте");
+
         FailedLoginAttempts = 0;
         LastAccessAt = DateTime.UtcNow;
     }

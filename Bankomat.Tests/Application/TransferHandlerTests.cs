@@ -135,7 +135,7 @@ public class TransferHandlerTests
     }
 
     [Fact]
-    public async Task Transfer_Success_CommitsTransaction()
+    public async Task Transfer_Success_SavesAtomicallyOnce()
     {
         var from = TestData.CreateAccount(balance: 1000, id: 1);
         var to = TestData.CreateAccount("5555666677778888", balance: 500, id: 2);
@@ -146,9 +146,74 @@ public class TransferHandlerTests
 
         await CreateHandler().HandleAsync(1, 1, "5555666677778888", 300);
 
-        _uow.Verify(u => u.BeginTransactionAsync(default), Times.Once);
-        _uow.Verify(u => u.CommitAsync(default), Times.Once);
-        _uow.Verify(u => u.RollbackAsync(default), Times.Never);
+        // Оба счёта и две записи журнала — один SaveChanges = одна транзакция БД
+        _uow.Verify(u => u.SaveChangesAsync(default), Times.Once);
+    }
+
+    [Fact]
+    public async Task Transfer_InsufficientFunds_DoesNotSave()
+    {
+        var from = TestData.CreateAccount(balance: 100, id: 1);
+        var to = TestData.CreateAccount("5555666677778888", balance: 500, id: 2);
+
+        _accounts.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(from);
+        _accounts.Setup(r => r.GetByCardNumberAsync(It.IsAny<CardNumber>(), default)).ReturnsAsync(to);
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(1, 1, "5555666677778888", 300);
+
+        result.IsFailure.Should().BeTrue();
+        _uow.Verify(u => u.SaveChangesAsync(It.IsAny<CancellationToken>()), Times.Never);
+        to.Balance.Amount.Should().Be(500);
+    }
+
+    [Fact]
+    public async Task Transfer_ConcurrencyConflict_ReturnsConflict()
+    {
+        var from = TestData.CreateAccount(balance: 1000, id: 1);
+        var to = TestData.CreateAccount("5555666677778888", balance: 500, id: 2);
+
+        _accounts.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(from);
+        _accounts.Setup(r => r.GetByCardNumberAsync(It.IsAny<CardNumber>(), default)).ReturnsAsync(to);
+        _uow.Setup(u => u.SaveChangesAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ConcurrencyConflictException("conflict"));
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(1, 1, "5555666677778888", 300);
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("CONFLICT");
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-5)]
+    [InlineData(10.005)]
+    public async Task Transfer_InvalidAmount_FailsWithoutDbAccess(decimal amount)
+    {
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(1, 1, "5555666677778888", amount);
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("VALIDATION");
+        _accounts.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task Transfer_CardWithDashes_IsAccepted()
+    {
+        var from = TestData.CreateAccount(balance: 1000, id: 1);
+        var to = TestData.CreateAccount("5555666677778888", balance: 0, id: 2);
+
+        _accounts.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(from);
+        _accounts.Setup(r => r.GetByCardNumberAsync(It.IsAny<CardNumber>(), default)).ReturnsAsync(to);
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(1, 1, "5555-6666-7777-8888", 100);
+
+        result.IsSuccess.Should().BeTrue();
+        to.Balance.Amount.Should().Be(100);
     }
 
     [Fact]

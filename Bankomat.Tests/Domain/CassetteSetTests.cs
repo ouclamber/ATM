@@ -151,15 +151,125 @@ public class CassetteSetTests
     }
 
     [Fact]
-    public void PlanWithdrawal_GreedyLimitation_DocumentsKnownBehavior()
+    public void PlanWithdrawal_CaseWhereGreedyFails_NowSucceeds()
     {
+        // Жадный алгоритм брал 5000 и не мог добрать 1000 → ложный отказ
         var atm = Atm.Create("A", "L").Value;
         atm.AddCassette(5000, 1, 100);
         atm.AddCassette(2000, 3, 100);
 
         var result = atm.PlanWithdrawal(Money.Of(6000));
 
+        result.IsSuccess.Should().BeTrue();
+        result.Value.Banknotes.Should().BeEquivalentTo(new Dictionary<int, int> { [2000] = 3 });
+    }
+
+    [Fact]
+    public void PlanWithdrawal_UsesFewestBanknotes()
+    {
+        var atm = Atm.Create("A", "L").Value;
+        atm.AddCassette(5000, 1, 100);
+        atm.AddCassette(2000, 4, 100);
+        atm.AddCassette(1000, 10, 100);
+
+        var plan = atm.PlanWithdrawal(Money.Of(8000)).Value;
+
+        plan.Banknotes.Should().BeEquivalentTo(new Dictionary<int, int> { [5000] = 1, [2000] = 1, [1000] = 1 });
+    }
+
+    [Fact]
+    public void PlanWithdrawal_RespectsLimitedCounts()
+    {
+        var atm = Atm.Create("A", "L").Value;
+        atm.AddCassette(500, 1, 100);
+        atm.AddCassette(100, 10, 100);
+
+        var plan = atm.PlanWithdrawal(Money.Of(1000)).Value;
+
+        plan.Banknotes[500].Should().Be(1);
+        plan.Banknotes[100].Should().Be(5);
+    }
+
+    [Fact]
+    public void PlanWithdrawal_AmountAboveTotalCash_FailsWithoutOverflow()
+    {
+        var atm = CreateAtm();
+
+        var result = atm.PlanWithdrawal(Money.Of(10_000_000_000m));
+
         result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("BUSINESS");
+    }
+
+    [Fact]
+    public void PlanWithdrawal_RandomizedAgainstBruteForce()
+    {
+        var rnd = new Random(12345);
+        int[] denoms = { 100, 500, 1000, 2000, 5000 };
+
+        for (var iteration = 0; iteration < 300; iteration++)
+        {
+            var atm = Atm.Create("A", "L").Value;
+            var counts = new Dictionary<int, int>();
+            foreach (var d in denoms)
+            {
+                if (rnd.Next(4) == 0) continue; // иногда кассеты нет
+                var c = rnd.Next(0, 4);
+                counts[d] = c;
+                atm.AddCassette(d, c, 100);
+            }
+
+            var amount = rnd.Next(1, 120) * 100;
+            var result = atm.PlanWithdrawal(Money.Of(amount));
+            var expectedMin = BruteForceMinNotes(counts, amount);
+
+            if (expectedMin is null)
+            {
+                result.IsFailure.Should().BeTrue($"сумма {amount} невыдаваема при {Describe(counts)}");
+                continue;
+            }
+
+            result.IsSuccess.Should().BeTrue($"сумма {amount} выдаваема при {Describe(counts)}");
+            var plan = result.Value;
+            plan.Total.Amount.Should().Be(amount);
+            plan.Banknotes.Values.Sum().Should().Be(expectedMin.Value, "должно быть минимальное число купюр");
+            foreach (var (d, n) in plan.Banknotes)
+                n.Should().BeLessThanOrEqualTo(counts[d]);
+        }
+    }
+
+    private static int? BruteForceMinNotes(Dictionary<int, int> counts, int amount)
+    {
+        var items = counts.ToList();
+        int? best = null;
+        void Go(int i, int rest, int notes)
+        {
+            if (rest == 0) { best = best is null ? notes : Math.Min(best.Value, notes); return; }
+            if (i == items.Count || rest < 0) return;
+            var (d, c) = items[i];
+            for (var k = 0; k <= c && k * d <= rest; k++)
+                Go(i + 1, rest - k * d, notes + k);
+        }
+        Go(0, amount, 0);
+        return best;
+    }
+
+    private static string Describe(Dictionary<int, int> counts) =>
+        string.Join(", ", counts.Select(x => $"{x.Key}×{x.Value}"));
+
+    [Fact]
+    public void ApplyWithdrawal_NotEnoughInOneCassette_ChangesNothing()
+    {
+        var atm = Atm.Create("A", "L").Value;
+        atm.AddCassette(5000, 10, 100);
+        atm.AddCassette(1000, 1, 100);
+        var plan = new WithdrawalPlan(new Dictionary<int, int> { [5000] = 2, [1000] = 5 });
+
+        var result = atm.ApplyWithdrawal(plan);
+
+        result.IsFailure.Should().BeTrue();
+        atm.Cassettes.First(c => c.Denomination == 5000).Count.Should().Be(10, "операция атомарна");
+        atm.Cassettes.First(c => c.Denomination == 1000).Count.Should().Be(1);
     }
 
     [Fact]
@@ -248,12 +358,87 @@ public class CassetteSetTests
     {
         var atm = CreateAtm();
         var before = atm.Cassettes.First(c => c.Denomination == 5000).Count;
-        var banknotes = new Dictionary<int, int> { [5000] = 0 };
+        var banknotes = new Dictionary<int, int> { [5000] = 0, [1000] = 1 };
 
         var result = atm.DepositBanknotes(banknotes);
 
         result.IsSuccess.Should().BeTrue();
         atm.Cassettes.First(c => c.Denomination == 5000).Count.Should().Be(before);
+        atm.Cassettes.First(c => c.Denomination == 1000).Count.Should().Be(101);
+    }
+
+    [Fact]
+    public void DepositBanknotes_OnlyZeros_Fails()
+    {
+        var atm = CreateAtm();
+
+        var result = atm.DepositBanknotes(new Dictionary<int, int> { [5000] = 0 });
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("VALIDATION");
+    }
+
+    [Fact]
+    public void DepositBanknotes_NegativeCount_FailsAndChangesNothing()
+    {
+        var atm = CreateAtm();
+
+        var result = atm.DepositBanknotes(new Dictionary<int, int> { [5000] = 1, [1000] = -1 });
+
+        result.IsFailure.Should().BeTrue();
+        atm.Cassettes.First(c => c.Denomination == 5000).Count.Should().Be(100);
+        atm.Cassettes.First(c => c.Denomination == 1000).Count.Should().Be(100);
+    }
+
+    [Fact]
+    public void DepositBanknotes_SecondCassetteOverflows_FirstIsNotChanged()
+    {
+        var atm = Atm.Create("A", "L").Value;
+        atm.AddCassette(5000, 10, 100);
+        atm.AddCassette(1000, 99, 100);
+
+        var result = atm.DepositBanknotes(new Dictionary<int, int> { [5000] = 5, [1000] = 5 });
+
+        result.IsFailure.Should().BeTrue();
+        atm.Cassettes.First(c => c.Denomination == 5000).Count.Should().Be(10, "операция атомарна");
+    }
+
+    [Fact]
+    public void DepositBanknotes_InactiveAtm_Fails()
+    {
+        var atm = CreateAtm();
+        atm.Deactivate();
+
+        var result = atm.DepositBanknotes(new Dictionary<int, int> { [1000] = 1 });
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("BUSINESS");
+    }
+
+    [Fact]
+    public void Refill_UpdatesMaintenanceDate()
+    {
+        var atm = CreateAtm();
+        var before = atm.LastMaintenanceAt;
+        Thread.Sleep(5);
+
+        var result = atm.Refill(new Dictionary<int, int> { [5000] = 10 });
+
+        result.IsSuccess.Should().BeTrue();
+        atm.LastMaintenanceAt.Should().BeAfter(before);
+        atm.Cassettes.First(c => c.Denomination == 5000).Count.Should().Be(110);
+    }
+
+    [Fact]
+    public void Refill_Failure_DoesNotUpdateMaintenanceDate()
+    {
+        var atm = CreateAtm();
+        var before = atm.LastMaintenanceAt;
+
+        var result = atm.Refill(new Dictionary<int, int> { [5000] = 1000 });
+
+        result.IsFailure.Should().BeTrue();
+        atm.LastMaintenanceAt.Should().Be(before);
     }
 
     [Fact]

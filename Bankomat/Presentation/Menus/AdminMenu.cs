@@ -1,4 +1,4 @@
-﻿using Bankomat.Application.Abstractions;
+using Bankomat.Application.Abstractions;
 using Bankomat.Application.AtmManagement;
 using Bankomat.Domain.Atms;
 using Bankomat.Domain.ValueObjects;
@@ -9,20 +9,22 @@ namespace Bankomat.Presentation.Menus;
 
 public class AdminMenu
 {
-    private readonly IServiceProvider _sp;
+    private static readonly Serilog.ILogger Log = Serilog.Log.ForContext<AdminMenu>();
+
+    private readonly IServiceScopeFactory _scopes;
     private readonly IBankConfig _config;
 
-    public AdminMenu(IServiceProvider sp, IBankConfig config)
+    public AdminMenu(IServiceScopeFactory scopes, IBankConfig config)
     {
-        _sp = sp;
+        _scopes = scopes;
         _config = config;
     }
 
-    public async Task RunAsync()
+    public async Task RunAsync(CancellationToken ct = default)
     {
-        while (true)
+        while (!ct.IsCancellationRequested)
         {
-            Console.Clear();
+            Ui.Clear();
             AnsiConsole.Write(new Panel("[yellow]УПРАВЛЕНИЕ БАНКОМАТОМ[/]")
                 .Border(BoxBorder.Rounded)
                 .Header("[white]Административная панель[/]")
@@ -37,37 +39,42 @@ public class AdminMenu
                         "Расчёт выдачи",
                         "Назад"));
 
-            switch (choice)
+            Func<Task>? action = choice switch
             {
-                case "Состояние кассет":  await ShowCassettesAsync(); break;
-                case "Пополнить кассеты": await RefillAsync(); break;
-                case "Расчёт выдачи":     await CalculateAsync(); break;
-                case "Назад":             return;
-            }
+                "Состояние кассет"  => () => ShowCassettesAsync(ct),
+                "Пополнить кассеты" => () => RefillAsync(ct),
+                "Расчёт выдачи"     => () => CalculateAsync(ct),
+                _ => null
+            };
+
+            if (action is null)
+                return;
+
+            await Ui.GuardAsync(action, Log, choice);
         }
     }
 
-    private async Task<Atm?> LoadAtmAsync()
+    private async Task<Atm?> LoadAtmAsync(CancellationToken ct)
     {
-        using var scope = _sp.CreateScope();
+        using var scope = _scopes.CreateScope();
         var repo = scope.ServiceProvider.GetRequiredService<IAtmRepository>();
-        return await repo.GetByIdAsync(_config.DefaultAtmId);
+        return await repo.GetByIdReadOnlyAsync(_config.DefaultAtmId, ct);
     }
 
-    private async Task ShowCassettesAsync()
+    private async Task ShowCassettesAsync(CancellationToken ct)
     {
-        Console.Clear();
-        var atm = await LoadAtmAsync();
+        Ui.Clear();
+        var atm = await LoadAtmAsync(ct);
         if (atm is null)
         {
-            AnsiConsole.MarkupLine("[red]Банкомат не найден[/]");
-            Console.ReadKey();
+            Ui.Error("Банкомат не найден");
+            Ui.WaitKey();
             return;
         }
 
         AnsiConsole.Write(new Panel($"[yellow]КАССЕТЫ БАНКОМАТА #{atm.Id}[/]")
             .Border(BoxBorder.Rounded)
-            .Header($"[white]{atm.Name}[/]")
+            .Header($"[white]{Ui.E(atm.Name)}[/]")
             .HeaderAlignment(Justify.Center));
 
         var table = new Table().Border(TableBorder.Rounded);
@@ -79,32 +86,30 @@ public class AdminMenu
 
         foreach (var c in atm.Cassettes.OrderByDescending(x => x.Denomination))
         {
-            var pct = (double)c.Count / c.MaxCapacity * 100;
+            var pct = c.MaxCapacity == 0 ? 0 : (double)c.Count / c.MaxCapacity * 100;
             var color = pct >= 80 ? "green" : pct >= 50 ? "yellow" : pct >= 20 ? "orange3" : "red";
 
             table.AddRow(
                 $"{c.Denomination} ₽",
                 $"{c.Count}",
                 $"{c.MaxCapacity}",
-                $"{c.TotalAmount()}",
+                Ui.E(c.TotalAmount()),
                 $"[{color}]{pct:F0}%[/]");
         }
 
         AnsiConsole.Write(table);
-        AnsiConsole.MarkupLine($"[white]Всего:[/] [green]{atm.TotalCash()}[/]");
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[yellow]Нажмите любую клавишу...[/]");
-        Console.ReadKey();
+        AnsiConsole.MarkupLine($"[white]Всего:[/] [green]{Ui.E(atm.TotalCash())}[/]");
+        Ui.WaitKey();
     }
 
-    private async Task RefillAsync()
+    private async Task RefillAsync(CancellationToken ct)
     {
-        Console.Clear();
-        var atm = await LoadAtmAsync();
+        Ui.Clear();
+        var atm = await LoadAtmAsync(ct);
         if (atm is null)
         {
-            AnsiConsole.MarkupLine("[red]Банкомат не найден[/]");
-            Console.ReadKey();
+            Ui.Error("Банкомат не найден");
+            Ui.WaitKey();
             return;
         }
 
@@ -113,11 +118,13 @@ public class AdminMenu
 
         var banknotes = new Dictionary<int, int>();
 
-        foreach (var denom in Denomination.AllValues.OrderByDescending(x => x))
+        // Только существующие кассеты (раньше предлагался номинал без кассеты с «макс 2000»,
+        // а потом домен всё равно отклонял операцию)
+        foreach (var cassette in atm.Cassettes.OrderByDescending(c => c.Denomination))
         {
-            var cassette = atm.Cassettes.FirstOrDefault(c => c.Denomination == denom);
-            var current = cassette?.Count ?? 0;
-            var max = cassette?.MaxCapacity ?? 2000;
+            var denom = cassette.Denomination;
+            var current = cassette.Count;
+            var max = cassette.MaxCapacity;
 
             var count = AnsiConsole.Prompt(
                 new TextPrompt<int>($"[white]Купюр по {denom} ₽ (есть {current}, макс {max}):[/]")
@@ -138,54 +145,54 @@ public class AdminMenu
 
         if (banknotes.Count == 0)
         {
-            AnsiConsole.MarkupLine("[yellow]Нечего пополнять[/]");
-            await Task.Delay(1500);
+            Ui.Warning("Нечего пополнять");
+            await Task.Delay(1500, ct);
             return;
         }
 
         var totalAmount = banknotes.Sum(x => (decimal)x.Key * x.Value);
         var confirm = AnsiConsole.Prompt(
             new SelectionPrompt<string>()
-                .Title($"[white]Подтвердить пополнение на {totalAmount:C}?[/]")
+                .Title($"[white]Подтвердить пополнение на {Ui.E(totalAmount.ToString("C"))}?[/]")
                 .AddChoices("Да", "Нет"));
 
         if (confirm == "Нет")
         {
-            AnsiConsole.MarkupLine("[yellow]Отменено[/]");
-            await Task.Delay(1200);
+            Ui.Warning("Отменено");
+            await Task.Delay(1200, ct);
             return;
         }
 
-        using var scope = _sp.CreateScope();
+        using var scope = _scopes.CreateScope();
         var handler = scope.ServiceProvider.GetRequiredService<RefillHandler>();
-        var result = await handler.HandleAsync(_config.DefaultAtmId, banknotes);
+        var result = await handler.HandleAsync(_config.DefaultAtmId, banknotes, ct);
 
-        Console.Clear();
+        Ui.Clear();
         if (result.IsSuccess)
         {
             AnsiConsole.MarkupLine("[green]Кассеты пополнены[/]");
         }
         else
         {
-            AnsiConsole.MarkupLine($"[red]{result.Error.Message}[/]");
+            Ui.Error(result.Error.Message);
         }
-        await Task.Delay(2000);
+        await Task.Delay(2000, ct);
     }
 
-    private async Task CalculateAsync()
+    private async Task CalculateAsync(CancellationToken ct)
     {
-        Console.Clear();
-        var atm = await LoadAtmAsync();
+        Ui.Clear();
+        var atm = await LoadAtmAsync(ct);
         if (atm is null)
         {
-            AnsiConsole.MarkupLine("[red]Банкомат не найден[/]");
-            Console.ReadKey();
+            Ui.Error("Банкомат не найден");
+            Ui.WaitKey();
             return;
         }
 
         AnsiConsole.Write(new Panel("[yellow]РАСЧЁТ ВЫДАЧИ КУПЮР[/]")
             .Border(BoxBorder.Rounded)
-            .Header($"[white]Доступно: {atm.TotalCash()}[/]")
+            .Header($"[white]Доступно: {Ui.E(atm.TotalCash())}[/]")
             .HeaderAlignment(Justify.Center));
 
         var amount = AnsiConsole.Prompt(
@@ -198,17 +205,17 @@ public class AdminMenu
         var moneyResult = Money.Create(amount);
         if (moneyResult.IsFailure)
         {
-            AnsiConsole.MarkupLine($"[red]{moneyResult.Error.Message}[/]");
-            Console.ReadKey();
+            Ui.Error(moneyResult.Error.Message);
+            Ui.WaitKey();
             return;
         }
 
         var planResult = atm.PlanWithdrawal(moneyResult.Value);
 
-        Console.Clear();
+        Ui.Clear();
         if (planResult.IsFailure)
         {
-            AnsiConsole.MarkupLine($"[red]{planResult.Error.Message}[/]");
+            Ui.Error(planResult.Error.Message);
         }
         else
         {
@@ -221,11 +228,9 @@ public class AdminMenu
                 table.AddRow($"{denom} ₽", $"{count}", $"{denom * count} ₽");
 
             AnsiConsole.Write(table);
-            AnsiConsole.MarkupLine($"[green]Итого: {planResult.Value.Total}[/]");
+            Ui.Success($"Итого: {planResult.Value.Total}");
         }
 
-        AnsiConsole.WriteLine();
-        AnsiConsole.MarkupLine("[yellow]Нажмите любую клавишу...[/]");
-        Console.ReadKey();
+        Ui.WaitKey();
     }
 }

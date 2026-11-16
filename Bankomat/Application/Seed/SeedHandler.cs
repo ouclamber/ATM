@@ -1,4 +1,5 @@
-﻿using Bankomat.Application.Abstractions;
+using Bankomat.Application.Abstractions;
+using Bankomat.Application.Common;
 using Bankomat.Domain.Accounts;
 using Bankomat.Domain.Atms;
 using Bankomat.Domain.Common;
@@ -46,43 +47,48 @@ public class SeedHandler
     private async Task SeedAtmIfNeededAsync(CancellationToken ct)
     {
         var atmId = _config.DefaultAtmId;
-        var atm = await _atms.GetByIdAsync(atmId, ct);
-        if (atm is not null)
+
+        // Раньше банкомат создавался, если не найден Id из конфигурации. Но Id генерирует БД,
+        // поэтому при DefaultATMId != 1 новый банкомат создавался при КАЖДОМ запуске.
+        // Теперь создаём банкомат только в пустой БД, а потом проверяем, что настроенный Id существует.
+        if (!await _atms.AnyAsync(ct))
         {
-            _logger.LogDebug("Seed: банкомат {AtmId} уже существует, пропуск", atmId);
-            return;
+            _logger.LogInformation("Seed: банкоматов нет, создаю банкомат по умолчанию");
+
+            var atmResult = Atm.Create("Главный банкомат", "Москва, ул. Примерная, д. 1");
+            if (atmResult.IsFailure)
+                throw new DomainException(atmResult.Error.Message);
+
+            var createdAtm = atmResult.Value;
+
+            var cassettes = new (int denom, int count, int max)[]
+            {
+                (5000, 100, 200),
+                (2000, 150, 250),
+                (1000, 200, 300),
+                (500,  300, 400),
+                (100,  500, 1000)
+            };
+
+            foreach (var (denom, count, max) in cassettes)
+            {
+                var addResult = createdAtm.AddCassette(denom, count, max);
+                if (addResult.IsFailure)
+                    throw new DomainException(addResult.Error.Message);
+            }
+
+            await _atms.AddAsync(createdAtm, ct);
+            await _uow.SaveChangesAsync(ct);
+
+            _logger.LogInformation(
+                "Seed: банкомат #{AtmId} создан с {CassetteCount} кассетами, всего {TotalCash}",
+                createdAtm.Id, cassettes.Length, createdAtm.TotalCash());
         }
 
-        _logger.LogInformation("Seed: создание банкомата {AtmId}", atmId);
-
-        var atmResult = Atm.Create("Главный банкомат", "Москва, ул. Примерная, д. 1");
-        if (atmResult.IsFailure)
-            throw new DomainException(atmResult.Error.Message);
-
-        var createdAtm = atmResult.Value;
-
-        var cassettes = new (int denom, int count, int max)[]
-        {
-            (5000, 100, 200),
-            (2000, 150, 250),
-            (1000, 200, 300),
-            (500,  300, 400),
-            (100,  500, 1000)
-        };
-
-        foreach (var (denom, count, max) in cassettes)
-        {
-            var addResult = createdAtm.AddCassette(denom, count, max);
-            if (addResult.IsFailure)
-                throw new DomainException(addResult.Error.Message);
-        }
-
-        await _atms.AddAsync(createdAtm, ct);
-        await _uow.SaveChangesAsync(ct);
-
-        _logger.LogInformation(
-            "Seed: банкомат создан с {CassetteCount} кассетами, всего {TotalCash}",
-            cassettes.Length, createdAtm.TotalCash());
+        if (await _atms.GetByIdAsync(atmId, ct) is null)
+            throw new InvalidOperationException(
+                $"Банкомат с Id={atmId} (ATM:DefaultATMId) не найден в БД. " +
+                "Исправьте ATM:DefaultATMId в appsettings.json.");
     }
 
     private async Task SeedAccountsIfNeededAsync(CancellationToken ct)
@@ -100,35 +106,42 @@ public class SeedHandler
         _logger.LogInformation(
             "Seed: проверка {Count} тестовых клиентов", accounts.Count);
 
-        var created = 0;
-
+        var cards = new List<(SeedAccount Seed, CardNumber Card)>();
         foreach (var seed in accounts)
         {
             var cardResult = CardNumber.Create(seed.CardNumber);
             if (cardResult.IsFailure)
-                throw new DomainException($"Неверный номер карты в seed: {seed.CardNumber}");
+                throw new DomainException($"Неверный номер карты в seed: {MaskCard(seed.CardNumber)}");
+            cards.Add((seed, cardResult.Value));
+        }
 
-            var existing = await _accounts.GetByCardNumberAsync(cardResult.Value, ct);
-            if (existing is not null)
+        // Один запрос вместо N и никакого BCrypt для уже существующих карт (BCrypt намеренно медленный)
+        var existing = await _accounts.GetExistingCardNumbersAsync(cards.Select(c => c.Card).ToList(), ct);
+
+        var created = 0;
+        foreach (var (seed, card) in cards)
+        {
+            if (existing.Contains(card.Value))
             {
-                _logger.LogDebug(
-                    "Seed: карта {Card} уже существует, пропуск",
-                    MaskCard(seed.CardNumber));
+                _logger.LogDebug("Seed: карта {Card} уже существует, пропуск", MaskCard(seed.CardNumber));
                 continue;
             }
 
             var moneyResult = Money.Create(seed.InitialBalance);
             if (moneyResult.IsFailure)
-                throw new DomainException($"Неверный баланс для {seed.CardNumber}");
+                throw new DomainException($"Неверный баланс для {MaskCard(seed.CardNumber)}");
 
-            var hash = _hasher.Hash(seed.Pin);
+            var pinResult = PinCode.Create(seed.Pin);
+            if (pinResult.IsFailure)
+                throw new DomainException($"Неверный PIN в seed для {MaskCard(seed.CardNumber)}: {pinResult.Error.Message}");
 
             var accountResult = BankAccount.Create(
-                cardResult.Value, hash, seed.Holder, moneyResult.Value);
+                card, _hasher.Hash(pinResult.Value.Value), seed.Holder, moneyResult.Value);
             if (accountResult.IsFailure)
                 throw new DomainException(accountResult.Error.Message);
 
             await _accounts.AddAsync(accountResult.Value, ct);
+            existing.Add(card.Value); // защита от дублей внутри самого seed
             created++;
 
             _logger.LogInformation(
@@ -147,8 +160,7 @@ public class SeedHandler
         }
     }
 
-    private static string MaskCard(string card) =>
-        card.Length >= 4 ? $"**** **** **** {card[^4..]}" : "****";
+    private static string MaskCard(string card) => LogFormat.MaskCard(card);
 
     private sealed class SeedAccount
     {

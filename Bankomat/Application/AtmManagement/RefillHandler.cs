@@ -1,4 +1,5 @@
-﻿using Bankomat.Application.Abstractions;
+using Bankomat.Application.Abstractions;
+using Bankomat.Application.Common;
 using Bankomat.Domain.Atms;
 using Bankomat.Domain.Common;
 using Microsoft.Extensions.Logging;
@@ -27,14 +28,7 @@ public class RefillHandler
     {
         _logger.LogInformation(
             "Refill: начало инкассации, банкомат {AtmId}, купюры: {Banknotes}",
-            atmId, FormatBanknotes(banknotes));
-
-        if (banknotes.Count == 0)
-        {
-            _logger.LogWarning(
-                "Refill: пустой список купюр, банкомат {AtmId}", atmId);
-            return Error.Validation("Не указано ни одной купюры");
-        }
+            atmId, LogFormat.Banknotes(banknotes));
 
         var atm = await _atms.GetByIdAsync(atmId, ct);
         if (atm is null)
@@ -45,7 +39,7 @@ public class RefillHandler
 
         var cashBefore = atm.TotalCash().Amount;
 
-        var result = atm.DepositBanknotes(banknotes);
+        var result = atm.Refill(banknotes);
         if (result.IsFailure)
         {
             _logger.LogWarning(
@@ -54,26 +48,15 @@ public class RefillHandler
             return result.Error;
         }
 
-        await _uow.SaveChangesAsync(ct);
+        var saved = await _uow.TrySaveChangesAsync(ct);
+        if (saved.IsFailure)
+            return saved.Error;
 
         var cashAfter = atm.TotalCash().Amount;
-        var addedAmount = cashAfter - cashBefore;
-
         _logger.LogInformation(
             "Refill: успешно, банкомат {AtmId}, добавлено {Added}, всего в банкомате {Total}",
-            atmId, addedAmount, cashAfter);
+            atmId, cashAfter - cashBefore, cashAfter);
 
         return Result.Success();
-    }
-
-    private static string FormatBanknotes(IReadOnlyDictionary<int, int> banknotes)
-    {
-        if (banknotes.Count == 0)
-            return "[]";
-
-        return "[" + string.Join(", ", banknotes
-            .Where(x => x.Value > 0)
-            .OrderByDescending(x => x.Key)
-            .Select(x => $"{x.Key}×{x.Value}")) + "]";
     }
 }

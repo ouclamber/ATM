@@ -1,4 +1,4 @@
-﻿using Bankomat.Domain.Common;
+using Bankomat.Domain.Common;
 using Bankomat.Domain.ValueObjects;
 
 namespace Bankomat.Domain.Atms;
@@ -69,35 +69,79 @@ public class Atm : AggregateRoot
         return CassetteSet.PlanWithdrawal(_cassettes, amount);
     }
 
+    /// <summary>
+    /// Списывает купюры по плану. Операция атомарна: сначала проверяются все кассеты,
+    /// и только потом меняется состояние, поэтому при ошибке агрегат не остаётся «наполовину изменённым».
+    /// </summary>
     public Result ApplyWithdrawal(WithdrawalPlan plan)
     {
+        if (!IsActive)
+            return Error.Business("Банкомат неактивен");
+
         foreach (var (denomination, count) in plan.Banknotes)
         {
-            var cassette = _cassettes.FirstOrDefault(c => c.Denomination == denomination);
+            if (count < 0)
+                return Error.Validation("Количество купюр не может быть отрицательным");
+
+            var cassette = FindCassette(denomination);
             if (cassette is null)
                 return Error.Business($"Кассета {denomination} ₽ не найдена");
-
-            var debitResult = cassette.Debit(count);
-            if (debitResult.IsFailure)
-                return debitResult.Error;
+            if (cassette.Count < count)
+                return Error.Business(
+                    $"В кассете {denomination} ₽ недостаточно купюр (есть {cassette.Count}, нужно {count})");
         }
+
+        foreach (var (denomination, count) in plan.Banknotes)
+            FindCassette(denomination)!.Debit(count);
+
         return Result.Success();
     }
 
+    /// <summary>Приём наличных от клиента. Атомарно: либо принимаются все купюры, либо ни одной.</summary>
     public Result DepositBanknotes(IReadOnlyDictionary<int, int> banknotes)
     {
+        if (!IsActive)
+            return Error.Business("Банкомат неактивен");
+
+        return AddBanknotes(banknotes);
+    }
+
+    /// <summary>Инкассация (пополнение кассет администратором). Обновляет дату обслуживания.</summary>
+    public Result Refill(IReadOnlyDictionary<int, int> banknotes)
+    {
+        var result = AddBanknotes(banknotes);
+        if (result.IsSuccess)
+            LastMaintenanceAt = DateTime.UtcNow;
+        return result;
+    }
+
+    private Result AddBanknotes(IReadOnlyDictionary<int, int> banknotes)
+    {
+        if (banknotes.Count == 0 || banknotes.Values.All(c => c == 0))
+            return Error.Validation("Не указано ни одной купюры");
+
         foreach (var (denomination, count) in banknotes)
         {
-            if (count <= 0) continue;
+            if (count < 0)
+                return Error.Validation($"Количество купюр {denomination} ₽ не может быть отрицательным");
+            if (count == 0) continue;
 
-            var cassette = _cassettes.FirstOrDefault(c => c.Denomination == denomination);
+            var cassette = FindCassette(denomination);
             if (cassette is null)
                 return Error.Business($"Кассета {denomination} ₽ отсутствует");
-
-            var creditResult = cassette.Credit(count);
-            if (creditResult.IsFailure)
-                return creditResult.Error;
+            if ((long)cassette.Count + count > cassette.MaxCapacity)
+                return Error.Business($"Кассета {denomination} ₽ переполнена (макс {cassette.MaxCapacity})");
         }
+
+        foreach (var (denomination, count) in banknotes)
+        {
+            if (count > 0)
+                FindCassette(denomination)!.Credit(count);
+        }
+
         return Result.Success();
     }
+
+    private Cassette? FindCassette(int denomination) =>
+        _cassettes.FirstOrDefault(c => c.Denomination == denomination);
 }

@@ -1,3 +1,4 @@
+using Bankomat.Application.Accounts;
 using Bankomat.Application.Abstractions;
 using Bankomat.Application.Authentication;
 using Bankomat.Domain.Accounts;
@@ -144,5 +145,36 @@ public class LoginHandlerTests
             r => r.AddAsync(It.IsAny<Transaction>(), default),
             Times.Once);
         _uow.Verify(u => u.SaveChangesAsync(default), Times.AtLeastOnce);
+    }
+
+    [Fact]
+    public async Task Login_Success_ReturnsSnapshotNotEntity()
+    {
+        var account = TestData.CreateAccount(balance: 777, id: 5, holder: "Пётр");
+        _accounts.Setup(r => r.GetByCardNumberAsync(It.IsAny<CardNumber>(), default)).ReturnsAsync(account);
+        _hasher.Setup(h => h.Verify("1234", "hash")).Returns(true);
+
+        var result = await CreateHandler().HandleAsync("1111 2222 3333 4444", "1234", 1);
+
+        result.IsSuccess.Should().BeTrue();
+        result.Value.Should().BeOfType<AccountSummary>();
+        result.Value.HolderName.Should().Be("Пётр");
+        result.Value.Balance.Amount.Should().Be(777);
+        result.Value.FormattedCard.Should().Be("1111 2222 3333 4444");
+    }
+
+    [Fact]
+    public async Task Login_WrongPin_ReportsRemainingAttempts()
+    {
+        var account = TestData.CreateAccount(id: 1);
+        _accounts.Setup(r => r.GetByCardNumberAsync(It.IsAny<CardNumber>(), default)).ReturnsAsync(account);
+        _hasher.Setup(h => h.Verify(It.IsAny<string>(), "hash")).Returns(false);
+
+        var handler = CreateHandler();
+        var first = await handler.HandleAsync("1111222233334444", "0000", 1);
+        var second = await handler.HandleAsync("1111222233334444", "0000", 1);
+
+        first.Error.Message.Should().Contain("Осталось попыток: 2");
+        second.Error.Message.Should().Contain("Осталось попыток: 1");
     }
 }

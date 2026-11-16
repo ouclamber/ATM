@@ -16,7 +16,7 @@ public sealed class CardNumber : ValueObject
         var clean = input.Replace(" ", "").Replace("-", "");
         if (clean.Length != 16)
             return Error.Validation("Номер карты должен содержать 16 цифр");
-        if (!clean.All(char.IsDigit))
+        if (!clean.All(char.IsAsciiDigit))
             return Error.Validation("Номер карты должен содержать только цифры");
 
         return new CardNumber(clean);

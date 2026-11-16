@@ -1,4 +1,6 @@
-﻿using Bankomat.Application.Abstractions;
+using Bankomat.Application.Abstractions;
+using Bankomat.Application.Accounts;
+using Bankomat.Application.Common;
 using Bankomat.Domain.Accounts;
 using Bankomat.Domain.Common;
 using Bankomat.Domain.Transactions;
@@ -29,7 +31,7 @@ public class LoginHandler
         _logger = logger;
     }
 
-    public async Task<Result<BankAccount>> HandleAsync(
+    public async Task<Result<AccountSummary>> HandleAsync(
         string cardNumberRaw, string pinRaw, int atmId,
         CancellationToken ct = default)
     {
@@ -42,42 +44,44 @@ public class LoginHandler
             return cardResult.Error;
         }
         var card = cardResult.Value;
+        var masked = LogFormat.MaskCard(card.Value);
 
         var pinResult = PinCode.Create(pinRaw);
         if (pinResult.IsFailure)
         {
-            _logger.LogWarning(
-                "Login: неверный формат PIN, карта {Card}", MaskCard(card.Value));
+            _logger.LogWarning("Login: неверный формат PIN, карта {Card}", masked);
             return pinResult.Error;
         }
 
         var account = await _accounts.GetByCardNumberAsync(card, ct);
         if (account is null)
         {
-            _logger.LogWarning("Login: карта {Card} не найдена", MaskCard(card.Value));
+            _logger.LogWarning("Login: карта {Card} не найдена", masked);
             return Error.NotFound("Карта не найдена");
         }
 
         if (account.IsBlocked)
         {
             _logger.LogWarning(
-                "Login: карта {Card} заблокирована, счёт {AccountId}",
-                MaskCard(card.Value), account.Id);
+                "Login: карта {Card} заблокирована, счёт {AccountId}", masked, account.Id);
             return Error.Forbidden("Карта заблокирована. Обратитесь в банк.");
         }
 
         if (!_hasher.Verify(pinResult.Value.Value, account.PinHash))
         {
             account.RegisterFailedLogin();
-            await _uow.SaveChangesAsync(ct);
+            var save = await _uow.TrySaveChangesAsync(ct);
+            if (save.IsFailure)
+                return save.Error;
 
             _logger.LogWarning(
                 "Login: неверный PIN, карта {Card}, счёт {AccountId}, попыток {Attempts}, заблокирована: {Blocked}",
-                MaskCard(card.Value), account.Id, account.FailedLoginAttempts, account.IsBlocked);
+                masked, account.Id, account.FailedLoginAttempts, account.IsBlocked);
 
             return account.IsBlocked
-                ? Error.Forbidden("Карта заблокирована из-за 3 неудачных попыток ввода PIN")
-                : Error.Forbidden($"Неверный PIN. Осталось попыток: {3 - account.FailedLoginAttempts}");
+                ? Error.Forbidden(
+                    $"Карта заблокирована из-за {BankAccount.MaxFailedAttempts} неудачных попыток ввода PIN")
+                : Error.Forbidden($"Неверный PIN. Осталось попыток: {account.RemainingAttempts}");
         }
 
         account.RegisterSuccessfulLogin();
@@ -88,15 +92,13 @@ public class LoginHandler
             "Вход в систему");
 
         await _transactions.AddAsync(log, ct);
-        await _uow.SaveChangesAsync(ct);
+        var saved = await _uow.TrySaveChangesAsync(ct);
+        if (saved.IsFailure)
+            return saved.Error;
 
         _logger.LogInformation(
-            "Login: успешный вход, карта {Card}, счёт {AccountId}, баланс {Balance}",
-            MaskCard(card.Value), account.Id, account.Balance);
+            "Login: успешный вход, карта {Card}, счёт {AccountId}", masked, account.Id);
 
-        return account;
+        return AccountSummary.From(account);
     }
-
-    private static string MaskCard(string card) =>
-        card.Length >= 4 ? $"**** **** **** {card[^4..]}" : "****";
 }

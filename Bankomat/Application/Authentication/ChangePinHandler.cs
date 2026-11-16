@@ -1,4 +1,5 @@
-﻿using Bankomat.Application.Abstractions;
+using Bankomat.Application.Abstractions;
+using Bankomat.Application.Common;
 using Bankomat.Domain.Accounts;
 using Bankomat.Domain.Common;
 using Bankomat.Domain.ValueObjects;
@@ -29,29 +30,25 @@ public class ChangePinHandler
         int accountId, string oldPinRaw, string newPinRaw,
         CancellationToken ct = default)
     {
-        _logger.LogInformation(
-            "ChangePin: запрос смены PIN, счёт {AccountId}", accountId);
+        _logger.LogInformation("ChangePin: запрос смены PIN, счёт {AccountId}", accountId);
 
         var oldPinResult = PinCode.Create(oldPinRaw);
         if (oldPinResult.IsFailure)
         {
-            _logger.LogWarning(
-                "ChangePin: неверный формат старого PIN, счёт {AccountId}", accountId);
+            _logger.LogWarning("ChangePin: неверный формат старого PIN, счёт {AccountId}", accountId);
             return oldPinResult.Error;
         }
 
         var newPinResult = PinCode.Create(newPinRaw);
         if (newPinResult.IsFailure)
         {
-            _logger.LogWarning(
-                "ChangePin: неверный формат нового PIN, счёт {AccountId}", accountId);
+            _logger.LogWarning("ChangePin: неверный формат нового PIN, счёт {AccountId}", accountId);
             return newPinResult.Error;
         }
 
-        if (oldPinRaw == newPinRaw)
+        if (oldPinResult.Value == newPinResult.Value)
         {
-            _logger.LogWarning(
-                "ChangePin: новый PIN совпадает со старым, счёт {AccountId}", accountId);
+            _logger.LogWarning("ChangePin: новый PIN совпадает со старым, счёт {AccountId}", accountId);
             return Error.Validation("Новый PIN совпадает со старым");
         }
 
@@ -62,15 +59,31 @@ public class ChangePinHandler
             return Error.NotFound("Счет не найден");
         }
 
-        if (!_hasher.Verify(oldPinResult.Value.Value, account.PinHash))
+        if (account.IsBlocked)
         {
-            _logger.LogWarning(
-                "ChangePin: неверный текущий PIN, счёт {AccountId}", accountId);
-            return Error.Forbidden("Неверный текущий PIN");
+            _logger.LogWarning("ChangePin: карта заблокирована, счёт {AccountId}", accountId);
+            return Error.Forbidden("Карта заблокирована. Обратитесь в банк.");
         }
 
-        var hash = _hasher.Hash(newPinResult.Value.Value);
-        var result = account.ChangePinHash(hash);
+        if (!_hasher.Verify(oldPinResult.Value.Value, account.PinHash))
+        {
+            // Неверный текущий PIN считается неудачной попыткой входа:
+            // иначе через смену PIN можно бесконечно перебирать PIN в открытой сессии.
+            account.RegisterFailedLogin();
+            var save = await _uow.TrySaveChangesAsync(ct);
+            if (save.IsFailure)
+                return save.Error;
+
+            _logger.LogWarning(
+                "ChangePin: неверный текущий PIN, счёт {AccountId}, попыток {Attempts}, заблокирована: {Blocked}",
+                accountId, account.FailedLoginAttempts, account.IsBlocked);
+
+            return account.IsBlocked
+                ? Error.Forbidden("Карта заблокирована из-за неверного ввода PIN. Обратитесь в банк.")
+                : Error.Forbidden($"Неверный текущий PIN. Осталось попыток: {account.RemainingAttempts}");
+        }
+
+        var result = account.ChangePinHash(_hasher.Hash(newPinResult.Value.Value));
         if (result.IsFailure)
         {
             _logger.LogWarning(
@@ -79,11 +92,14 @@ public class ChangePinHandler
             return result.Error;
         }
 
-        await _uow.SaveChangesAsync(ct);
+        // Успешная проверка PIN сбрасывает счётчик ошибок, как и при входе
+        account.RegisterSuccessfulLogin();
 
-        _logger.LogInformation(
-            "ChangePin: успех, счёт {AccountId}", accountId);
+        var saved = await _uow.TrySaveChangesAsync(ct);
+        if (saved.IsFailure)
+            return saved.Error;
 
+        _logger.LogInformation("ChangePin: успех, счёт {AccountId}", accountId);
         return Result.Success();
     }
 }

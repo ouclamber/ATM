@@ -75,4 +75,64 @@ public class AdminAuthServiceTests
         act.Should().Throw<InvalidOperationException>()
             .WithMessage("*PasswordHash*");
     }
+
+    private sealed class ManualTimeProvider : TimeProvider
+    {
+        public DateTimeOffset Now { get; set; } = new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        public override DateTimeOffset GetUtcNow() => Now;
+    }
+
+    [Fact]
+    public void Verify_TooManyFailures_LocksOutEvenCorrectPassword()
+    {
+        var hash = BCrypt.Net.BCrypt.HashPassword("admin123", workFactor: 4);
+        var time = new ManualTimeProvider();
+        var service = new AdminAuthService(BuildConfig("admin", hash), time);
+
+        for (var i = 0; i < AdminAuthService.MaxFailedAttempts; i++)
+            service.Verify("admin", "wrong").Should().BeFalse();
+
+        service.LockoutRemaining.Should().NotBeNull();
+        service.Verify("admin", "admin123").Should().BeFalse("во время блокировки вход запрещён");
+    }
+
+    [Fact]
+    public void Verify_AfterLockoutExpires_AllowsLogin()
+    {
+        var hash = BCrypt.Net.BCrypt.HashPassword("admin123", workFactor: 4);
+        var time = new ManualTimeProvider();
+        var service = new AdminAuthService(BuildConfig("admin", hash), time);
+
+        for (var i = 0; i < AdminAuthService.MaxFailedAttempts; i++)
+            service.Verify("admin", "wrong");
+
+        time.Now += AdminAuthService.LockoutDuration + TimeSpan.FromSeconds(1);
+
+        service.LockoutRemaining.Should().BeNull();
+        service.Verify("admin", "admin123").Should().BeTrue();
+    }
+
+    [Fact]
+    public void Verify_SuccessResetsFailureCounter()
+    {
+        var hash = BCrypt.Net.BCrypt.HashPassword("admin123", workFactor: 4);
+        var service = new AdminAuthService(BuildConfig("admin", hash), new ManualTimeProvider());
+
+        for (var i = 0; i < AdminAuthService.MaxFailedAttempts - 1; i++)
+            service.Verify("admin", "wrong");
+        service.Verify("admin", "admin123").Should().BeTrue();
+        service.Verify("admin", "wrong");
+
+        service.LockoutRemaining.Should().BeNull();
+    }
+
+    [Fact]
+    public void Verify_InvalidHashInConfig_ThrowsClearError()
+    {
+        var service = new AdminAuthService(BuildConfig("admin", "not-a-bcrypt-hash"));
+
+        var act = () => service.Verify("admin", "x");
+
+        act.Should().Throw<InvalidOperationException>().WithMessage("*BCrypt*");
+    }
 }

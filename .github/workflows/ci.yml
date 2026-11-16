@@ -10,6 +10,25 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
 
+    # Настоящий PostgreSQL для интеграционных тестов (миграции, xmin, репозитории)
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      BANKOMAT_TEST_CONNECTION: "Host=localhost;Port=5432;Username=postgres;Password=postgres"
+      DOTNET_NOLOGO: true
+      DOTNET_CLI_TELEMETRY_OPTOUT: true
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4

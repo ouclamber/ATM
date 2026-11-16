@@ -1,4 +1,5 @@
-﻿using Bankomat.Application.Abstractions;
+using Bankomat.Application.Abstractions;
+using Bankomat.Application.Common;
 using Bankomat.Domain.Accounts;
 using Bankomat.Domain.Common;
 using Bankomat.Domain.Transactions;
@@ -35,120 +36,75 @@ public class TransferHandler
     {
         _logger.LogInformation(
             "Transfer: начало операции, счёт {FromAccountId}, банкомат {AtmId}, сумма {Amount}, карта получателя {ToCard}",
-            fromAccountId, atmId, amountValue, MaskCard(toCardRaw));
+            fromAccountId, atmId, amountValue, LogFormat.MaskCard(toCardRaw));
 
         var amountResult = Money.Create(amountValue);
         if (amountResult.IsFailure)
-        {
-            _logger.LogWarning(
-                "Transfer: невалидная сумма {Amount} — {Reason}",
-                amountValue, amountResult.Error.Message);
-            return amountResult.Error;
-        }
+            return Reject(fromAccountId, amountResult.Error);
         var amount = amountResult.Value;
 
-        if (amount.Amount > _config.MaxTransferPerTransaction)
-        {
-            _logger.LogWarning(
-                "Transfer: превышен лимит перевода, счёт {FromAccountId}, сумма {Amount}, лимит {Limit}",
-                fromAccountId, amount, _config.MaxTransferPerTransaction);
+        if (amount <= Money.Zero)
+            return Reject(fromAccountId, Error.Validation("Сумма должна быть больше нуля"));
 
-            return Error.Business(
-                $"Лимит перевода: {_config.MaxTransferPerTransaction:C}");
-        }
+        if (amount.Amount > _config.MaxTransferPerTransaction)
+            return Reject(fromAccountId, Error.Business(
+                $"Лимит перевода: {_config.MaxTransferPerTransaction:C}"));
 
         var toCardResult = CardNumber.Create(toCardRaw);
         if (toCardResult.IsFailure)
-        {
-            _logger.LogWarning(
-                "Transfer: неверный номер карты получателя, счёт {FromAccountId}",
-                fromAccountId);
-            return toCardResult.Error;
-        }
+            return Reject(fromAccountId, toCardResult.Error);
         var toCard = toCardResult.Value;
 
         var from = await _accounts.GetByIdAsync(fromAccountId, ct);
         if (from is null)
-        {
-            _logger.LogWarning(
-                "Transfer: счёт отправителя {FromAccountId} не найден", fromAccountId);
-            return Error.NotFound("Счет отправителя не найден");
-        }
+            return Reject(fromAccountId, Error.NotFound("Счет отправителя не найден"));
 
         if (from.CardNumber == toCard)
-        {
-            _logger.LogWarning(
-                "Transfer: попытка перевода на свою же карту, счёт {FromAccountId}",
-                fromAccountId);
-            return Error.Validation("Нельзя перевести на свою же карту");
-        }
+            return Reject(fromAccountId, Error.Validation("Нельзя перевести на свою же карту"));
 
         var to = await _accounts.GetByCardNumberAsync(toCard, ct);
         if (to is null)
-        {
-            _logger.LogWarning(
-                "Transfer: счёт получателя по карте {ToCard} не найден, счёт {FromAccountId}",
-                MaskCard(toCard.Value), fromAccountId);
-            return Error.NotFound("Счет получателя не найден по номеру карты");
-        }
+            return Reject(fromAccountId, Error.NotFound("Счет получателя не найден по номеру карты"));
 
-        await _uow.BeginTransactionAsync(ct);
-        try
-        {
-            var debitResult = from.Debit(amount);
-            if (debitResult.IsFailure)
-            {
-                await _uow.RollbackAsync(ct);
-                _logger.LogWarning(
-                    "Transfer: списание отклонено, счёт {FromAccountId}, сумма {Amount}, баланс {Balance}, причина: {Reason}",
-                    fromAccountId, amount, from.Balance, debitResult.Error.Message);
-                return debitResult.Error;
-            }
+        var fromBefore = from.Balance;
+        var toBefore = to.Balance;
 
-            var creditResult = to.Credit(amount);
-            if (creditResult.IsFailure)
-            {
-                await _uow.RollbackAsync(ct);
-                _logger.LogError(
-                    "Transfer: зачисление не удалось, счёт {ToAccountId}, причина: {Reason}",
-                    to.Id, creditResult.Error.Message);
-                return creditResult.Error;
-            }
+        var debitResult = from.Debit(amount);
+        if (debitResult.IsFailure)
+            return Reject(fromAccountId, debitResult.Error);
 
-            var outLog = Transaction.Record(
-                from.Id, atmId, TransactionType.TransferOut,
-                amount, from.Balance + amount, from.Balance,
-                $"Перевод на {to.CardNumber.Formatted()}", to.CardNumber.Value);
+        var creditResult = to.Credit(amount);
+        if (creditResult.IsFailure)
+            return Reject(fromAccountId, creditResult.Error);
 
-            var inLog = Transaction.Record(
-                to.Id, atmId, TransactionType.TransferIn,
-                amount, to.Balance - amount, to.Balance,
-                $"Перевод от {from.CardNumber.Formatted()}", from.CardNumber.Value);
+        await _transactions.AddAsync(Transaction.Record(
+            from.Id, atmId, TransactionType.TransferOut,
+            amount, fromBefore, from.Balance,
+            $"Перевод на {to.CardNumber.Formatted()}", to.CardNumber.Value), ct);
 
-            await _transactions.AddAsync(outLog, ct);
-            await _transactions.AddAsync(inLog, ct);
-            await _uow.SaveChangesAsync(ct);
-            await _uow.CommitAsync(ct);
+        await _transactions.AddAsync(Transaction.Record(
+            to.Id, atmId, TransactionType.TransferIn,
+            amount, toBefore, to.Balance,
+            $"Перевод от {from.CardNumber.Formatted()}", from.CardNumber.Value), ct);
 
-            _logger.LogInformation(
-                "Transfer: успешно, счёт {FromAccountId} → счёт {ToAccountId}, сумма {Amount}, новый баланс отправителя {Balance}",
-                fromAccountId, to.Id, amount, from.Balance);
+        // Оба счёта и обе записи журнала уходят в БД одним SaveChanges — это уже одна транзакция БД.
+        // Явная BeginTransaction/Commit вокруг одного SaveChanges ничего не добавляла.
+        var saved = await _uow.TrySaveChangesAsync(ct);
+        if (saved.IsFailure)
+            return Reject(fromAccountId, saved.Error);
 
-            return from.Balance;
-        }
-        catch (Exception ex)
-        {
-            await _uow.RollbackAsync(ct);
-            _logger.LogError(ex,
-                "Transfer: критическая ошибка, счёт {FromAccountId} → {ToAccountId}, сумма {Amount}",
-                fromAccountId, to.Id, amount);
-            throw;
-        }
+        _logger.LogInformation(
+            "Transfer: успешно, счёт {FromAccountId} → счёт {ToAccountId}, сумма {Amount}",
+            fromAccountId, to.Id, amount);
+
+        return from.Balance;
     }
 
-    private static string MaskCard(string card)
+    private Error Reject(int accountId, Error error)
     {
-        var clean = card.Replace(" ", "").Replace("-", "");
-        return clean.Length >= 4 ? $"**** **** **** {clean[^4..]}" : "****";
+        _logger.LogWarning(
+            "Transfer: отклонено, счёт {AccountId}, код {Code}, причина: {Reason}",
+            accountId, error.Code, error.Message);
+        return error;
     }
 }

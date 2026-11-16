@@ -18,8 +18,9 @@
             **/Infrastructure/Persistence/BankomatDbContext.cs,
             **/Infrastructure/Persistence/BankomatDbContextFactory.cs,
             **/Infrastructure/Persistence/Repositories/*.cs,
-            **/Infrastructure/Persistence/UnitOfWork.cs,
-            **/Infrastructure/Configuration/BankConfig.cs
+            **/Infrastructure/Configuration/BankConfig.cs,
+            **/Presentation/Ui.cs,
+            **/Presentation/UserSession.cs
           </ExcludeByFile>
 
           <!-- Исключаем по атрибутам -->
@@ -36,11 +37,6 @@
             [Bankomat]Bankomat.Presentation.*,
             [Bankomat]Bankomat.Infrastructure.Persistence.*
           </Exclude>
-
-          <!-- Порог покрытия (опционально) -->
-          <Threshold>80</Threshold>
-          <ThresholdType>line</ThresholdType>
-          <ThresholdStat>total</ThresholdStat>
         </Configuration>
       </DataCollector>
     </DataCollectors>

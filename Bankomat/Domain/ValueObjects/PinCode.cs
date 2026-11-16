@@ -14,7 +14,7 @@ public sealed class PinCode : ValueObject
             return Error.Validation("PIN не может быть пустым");
         if (input.Length != 4)
             return Error.Validation("PIN должен содержать 4 цифры");
-        if (!input.All(char.IsDigit))
+        if (!input.All(char.IsAsciiDigit))
             return Error.Validation("PIN должен содержать только цифры");
 
         return new PinCode(input);

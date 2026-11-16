@@ -1,4 +1,4 @@
-﻿using Bankomat.Domain.Common;
+using Bankomat.Domain.Common;
 using Bankomat.Domain.ValueObjects;
 
 namespace Bankomat.Domain.Atms;
@@ -37,7 +37,7 @@ public class Cassette : Entity
     {
         if (count < 0)
             return Error.Validation("Количество не может быть отрицательным");
-        if (Count + count > MaxCapacity)
+        if ((long)Count + count > MaxCapacity)
             return Error.Business($"Кассета {Denomination} ₽ переполнена (макс {MaxCapacity})");
 
         Count += count;

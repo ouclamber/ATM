@@ -1,4 +1,5 @@
-﻿using Bankomat.Application.Abstractions;
+using Bankomat.Application.Abstractions;
+using Bankomat.Application.Common;
 using Bankomat.Domain.Accounts;
 using Bankomat.Domain.Atms;
 using Bankomat.Domain.Common;
@@ -33,6 +34,8 @@ public class DepositHandler
         _logger = logger;
     }
 
+    /// <param name="amountValue">Заявленная сумма; должна точно совпасть с суммой купюр.</param>
+    /// <param name="banknotes">Номинал → количество купюр.</param>
     public async Task<Result<Money>> HandleAsync(
         int accountId, int atmId, decimal amountValue,
         IReadOnlyDictionary<int, int> banknotes,
@@ -40,102 +43,76 @@ public class DepositHandler
     {
         _logger.LogInformation(
             "Deposit: начало операции, счёт {AccountId}, банкомат {AtmId}, сумма {Amount}, купюры: {Banknotes}",
-            accountId, atmId, amountValue, FormatBanknotes(banknotes));
+            accountId, atmId, amountValue, LogFormat.Banknotes(banknotes));
 
         var amountResult = Money.Create(amountValue);
         if (amountResult.IsFailure)
-        {
-            _logger.LogWarning(
-                "Deposit: невалидная сумма {Amount} — {Reason}",
-                amountValue, amountResult.Error.Message);
-            return amountResult.Error;
-        }
+            return Reject(accountId, amountResult.Error);
         var amount = amountResult.Value;
 
-        if (amount.Amount > _config.MaxDepositPerTransaction)
-        {
-            _logger.LogWarning(
-                "Deposit: превышен лимит за операцию, счёт {AccountId}, сумма {Amount}, лимит {Limit}",
-                accountId, amount, _config.MaxDepositPerTransaction);
+        if (amount <= Money.Zero)
+            return Reject(accountId, Error.Validation("Сумма должна быть больше нуля"));
 
-            return Error.Business(
-                $"Лимит за операцию: {_config.MaxDepositPerTransaction:C}");
+        if (amount.Amount > _config.MaxDepositPerTransaction)
+            return Reject(accountId, Error.Business(
+                $"Лимит за операцию: {_config.MaxDepositPerTransaction:C}"));
+
+        // Раньше отрицательное количество проходило проверку суммы (5000×1 + 1000×(-1) = 4000),
+        // а банкомат молча игнорировал «-1»: в кассету попадало 5000, на счёт — 4000.
+        foreach (var (denomination, count) in banknotes)
+        {
+            if (count < 0)
+                return Reject(accountId, Error.Validation("Количество купюр не может быть отрицательным"));
+            if (Denomination.Create(denomination).IsFailure)
+                return Reject(accountId, Error.Validation($"Недопустимый номинал: {denomination}"));
         }
 
         var banknotesTotal = banknotes.Sum(x => (decimal)x.Key * x.Value);
-        if (Math.Abs(banknotesTotal - amount.Amount) > 0.01m)
-        {
-            _logger.LogWarning(
-                "Deposit: сумма купюр {BanknotesTotal} не совпадает с заявленной {Amount}, счёт {AccountId}",
-                banknotesTotal, amount, accountId);
-
-            return Error.Validation(
-                $"Сумма купюр ({banknotesTotal:C}) не совпадает с заявленной ({amount:C})");
-        }
+        if (banknotesTotal != amount.Amount)
+            return Reject(accountId, Error.Validation(
+                $"Сумма купюр ({banknotesTotal:C}) не совпадает с заявленной ({amount})"));
 
         var account = await _accounts.GetByIdAsync(accountId, ct);
         if (account is null)
-        {
-            _logger.LogWarning("Deposit: счёт {AccountId} не найден", accountId);
-            return Error.NotFound("Счет не найден");
-        }
+            return Reject(accountId, Error.NotFound("Счет не найден"));
 
         var atm = await _atms.GetByIdAsync(atmId, ct);
         if (atm is null)
-        {
-            _logger.LogWarning(
-                "Deposit: банкомат {AtmId} не найден, счёт {AccountId}", atmId, accountId);
-            return Error.NotFound("Банкомат не найден");
-        }
+            return Reject(accountId, Error.NotFound("Банкомат не найден"));
 
         if (!atm.IsActive)
-        {
-            _logger.LogWarning(
-                "Deposit: банкомат {AtmId} неактивен, счёт {AccountId}", atmId, accountId);
-            return Error.Business("Банкомат неактивен");
-        }
+            return Reject(accountId, Error.Business("Банкомат неактивен"));
 
         var depositResult = atm.DepositBanknotes(banknotes);
         if (depositResult.IsFailure)
-        {
-            _logger.LogWarning(
-                "Deposit: не удалось принять купюры, банкомат {AtmId}, причина: {Reason}",
-                atmId, depositResult.Error.Message);
-            return depositResult.Error;
-        }
+            return Reject(accountId, depositResult.Error);
 
+        var balanceBefore = account.Balance;
         var creditResult = account.Credit(amount);
         if (creditResult.IsFailure)
-        {
-            _logger.LogWarning(
-                "Deposit: зачисление отклонено, счёт {AccountId}, причина: {Reason}",
-                accountId, creditResult.Error.Message);
-            return creditResult.Error;
-        }
+            return Reject(accountId, creditResult.Error);
 
-        var log = Transaction.Record(
+        await _transactions.AddAsync(Transaction.Record(
             account.Id, atm.Id, TransactionType.Deposit,
-            amount, account.Balance - amount, account.Balance,
-            $"Внесение {amount}");
+            amount, balanceBefore, account.Balance,
+            $"Внесение {amount}"), ct);
 
-        await _transactions.AddAsync(log, ct);
-        await _uow.SaveChangesAsync(ct);
+        var saved = await _uow.TrySaveChangesAsync(ct);
+        if (saved.IsFailure)
+            return Reject(accountId, saved.Error);
 
         _logger.LogInformation(
-            "Deposit: успешно, счёт {AccountId}, банкомат {AtmId}, сумма {Amount}, новый баланс {Balance}",
-            accountId, atmId, amount, account.Balance);
+            "Deposit: успешно, счёт {AccountId}, банкомат {AtmId}, сумма {Amount}",
+            accountId, atmId, amount);
 
         return account.Balance;
     }
 
-    private static string FormatBanknotes(IReadOnlyDictionary<int, int> banknotes)
+    private Error Reject(int accountId, Error error)
     {
-        if (banknotes.Count == 0)
-            return "[]";
-
-        return "[" + string.Join(", ", banknotes
-            .Where(x => x.Value > 0)
-            .OrderByDescending(x => x.Key)
-            .Select(x => $"{x.Key}×{x.Value}")) + "]";
+        _logger.LogWarning(
+            "Deposit: отклонено, счёт {AccountId}, код {Code}, причина: {Reason}",
+            accountId, error.Code, error.Message);
+        return error;
     }
 }

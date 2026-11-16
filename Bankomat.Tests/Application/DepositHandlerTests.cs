@@ -182,4 +182,83 @@ public class DepositHandlerTests
             Times.Once);
         _uow.Verify(u => u.SaveChangesAsync(default), Times.Once);
     }
+
+    [Fact]
+    public async Task Deposit_NegativeBanknoteCount_FailsAndChangesNothing()
+    {
+        // 5000×1 + 1000×(-1) = 4000 — раньше проходило проверку суммы
+        var account = TestData.CreateAccount(balance: 1000, id: 1);
+        var atm = TestData.CreateAtm(id: 1);
+        _accounts.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(account);
+        _atms.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(atm);
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(
+            1, 1, 4000, new Dictionary<int, int> { [5000] = 1, [1000] = -1 });
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("VALIDATION");
+        account.Balance.Amount.Should().Be(1000);
+        atm.Cassettes.First(c => c.Denomination == 5000).Count.Should().Be(100);
+    }
+
+    [Fact]
+    public async Task Deposit_UnknownDenomination_Fails()
+    {
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(
+            1, 1, 300, new Dictionary<int, int> { [300] = 1 });
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("VALIDATION");
+    }
+
+    [Fact]
+    public async Task Deposit_ZeroAmount_FailsWithoutDbAccess()
+    {
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(1, 1, 0, new Dictionary<int, int>());
+
+        result.IsFailure.Should().BeTrue();
+        _accounts.VerifyNoOtherCalls();
+        _atms.VerifyNoOtherCalls();
+    }
+
+    [Fact]
+    public async Task Deposit_ConcurrencyConflict_ReturnsConflict()
+    {
+        var account = TestData.CreateAccount(balance: 1000, id: 1);
+        var atm = TestData.CreateAtm(id: 1);
+        _accounts.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(account);
+        _atms.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(atm);
+        _uow.Setup(u => u.SaveChangesAsync(It.IsAny<CancellationToken>()))
+            .ThrowsAsync(new ConcurrencyConflictException("conflict"));
+        SetupDefaultConfig();
+
+        var result = await CreateHandler().HandleAsync(1, 1, 1000, new Dictionary<int, int> { [1000] = 1 });
+
+        result.IsFailure.Should().BeTrue();
+        result.Error.Code.Should().Be("CONFLICT");
+    }
+
+    [Fact]
+    public async Task Deposit_WritesCorrectBalanceBeforeAndAfter()
+    {
+        var account = TestData.CreateAccount(balance: 1000, id: 1);
+        var atm = TestData.CreateAtm(id: 1);
+        _accounts.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(account);
+        _atms.Setup(r => r.GetByIdAsync(1, default)).ReturnsAsync(atm);
+        SetupDefaultConfig();
+
+        Transaction? captured = null;
+        _transactions.Setup(r => r.AddAsync(It.IsAny<Transaction>(), default))
+            .Callback<Transaction, CancellationToken>((t, _) => captured = t);
+
+        await CreateHandler().HandleAsync(1, 1, 2500, new Dictionary<int, int> { [2000] = 1, [500] = 1 });
+
+        captured!.BalanceBefore.Amount.Should().Be(1000);
+        captured.BalanceAfter.Amount.Should().Be(3500);
+    }
 }

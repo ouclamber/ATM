@@ -1,4 +1,4 @@
-﻿using Bankomat.Domain.Accounts;
+using Bankomat.Domain.Accounts;
 using Bankomat.Domain.ValueObjects;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
@@ -36,5 +36,10 @@ public class BankAccountConfiguration : IEntityTypeConfiguration<BankAccount>
         b.Property(x => x.FailedLoginAttempts).HasColumnName("failed_login_attempts");
         b.Property(x => x.CreatedAt).HasColumnName("created_at");
         b.Property(x => x.LastAccessAt).HasColumnName("last_access_at");
+
+        // Оптимистическая блокировка через системную колонку PostgreSQL xmin
+        // (меняется при каждом UPDATE строки, физически колонку создавать не нужно).
+        // Защищает от потерянного обновления баланса при параллельных операциях.
+        b.Property<uint>("xmin").IsRowVersion();
     }
 }
